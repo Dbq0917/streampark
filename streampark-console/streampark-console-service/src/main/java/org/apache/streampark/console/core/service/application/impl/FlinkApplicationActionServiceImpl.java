@@ -492,14 +492,44 @@ public class FlinkApplicationActionServiceImpl
             (response, throwable) -> {
                 // 1) remove Future
                 startFutureMap.remove(application.getId());
-                // 2) exception
-                if (throwable != null) {
-                    processForException(appParam, throwable, applicationLog, application);
-                    return;
+                try {
+                    // 2) exception
+                    if (throwable != null) {
+                        processForException(appParam, throwable, applicationLog, application);
+                        return;
+                    }
+                    // 3) success
+                    processForSuccess(appParam, response, applicationLog, application);
+                } catch (Exception e) {
+                    // The completion stage result is discarded, so an error raised here would
+                    // vanish silently and wedge the application in STARTING. Route it to the
+                    // standard failure handling instead.
+                    log.error(
+                        "[StreamPark] Failed to complete the start of application "
+                            + application.getId(),
+                        e);
+                    recordStartFailure(appParam, e, applicationLog, application);
                 }
-                // 3) success
-                processForSuccess(appParam, response, applicationLog, application);
             });
+    }
+
+    /**
+     * Routes an unexpected post-submit failure to the standard failure handling, so the
+     * application leaves STARTING with the cause recorded instead of wedging silently.
+     */
+    private void recordStartFailure(
+                                    FlinkApplication appParam,
+                                    Throwable throwable,
+                                    ApplicationLog applicationLog,
+                                    FlinkApplication application) {
+        try {
+            processForException(appParam, throwable, applicationLog, application);
+        } catch (Exception e) {
+            log.error(
+                "[StreamPark] Failed to record the start failure of application "
+                    + application.getId(),
+                e);
+        }
     }
 
     @Nonnull

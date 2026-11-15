@@ -338,45 +338,81 @@ public class SparkApplicationActionServiceImpl
             (response, throwable) -> {
                 // 1) remove Future
                 startJobFutureMap.remove(application.getId());
-
-                // 2) exception
-                if (throwable != null) {
-                    String exception = ExceptionUtils.stringifyException(throwable);
-                    applicationLog.setException(exception);
-                    applicationLog.setSuccess(false);
-                    applicationLogService.save(applicationLog);
-                    if (throwable instanceof CancellationException) {
-                        doStopped(application.getId());
-                    } else {
-                        SparkApplication app = getById(appParam.getId());
-                        app.setState(SparkAppStateEnum.FAILED.getValue());
-                        app.setOptionState(SparkOptionStateEnum.NONE.getValue());
-                        updateById(app);
-                        SparkAppHttpWatcher.unWatching(appParam.getId());
+                try {
+                    // 2) exception
+                    if (throwable != null) {
+                        processStartException(appParam, throwable, applicationLog);
+                        return;
                     }
-                    return;
+
+                    // 3) success
+                    applicationLog.setSuccess(true);
+                    application.resolveScheduleConf(response.sparkProperties());
+                    if (StringUtils.isNoneEmpty(response.sparkAppId())) {
+                        application.setClusterId(response.sparkAppId());
+                    }
+                    applicationLog.setClusterId(response.sparkAppId());
+                    applicationLog.setTrackingUrl(response.trackingUrl());
+                    application.setStartTime(new Date());
+                    application.setEndTime(null);
+
+                    // if start completed, will be added task to tracking queue
+                    SparkAppHttpWatcher.setOptionState(appParam.getId(), SparkOptionStateEnum.STARTING);
+                    SparkAppHttpWatcher.doWatching(application);
+
+                    // update app
+                    updateById(application);
+                    // save log
+                    applicationLogService.save(applicationLog);
+                } catch (Exception e) {
+                    // The completion stage result is discarded, so an error raised here would
+                    // vanish silently and wedge the application in STARTING. Route it to the
+                    // standard failure handling instead.
+                    log.error(
+                        "[StreamPark] Failed to complete the start of application "
+                            + application.getId(),
+                        e);
+                    recordStartFailure(appParam, e, applicationLog);
                 }
-
-                // 3) success
-                applicationLog.setSuccess(true);
-                application.resolveScheduleConf(response.sparkProperties());
-                if (StringUtils.isNoneEmpty(response.sparkAppId())) {
-                    application.setClusterId(response.sparkAppId());
-                }
-                applicationLog.setClusterId(response.sparkAppId());
-                applicationLog.setTrackingUrl(response.trackingUrl());
-                application.setStartTime(new Date());
-                application.setEndTime(null);
-
-                // if start completed, will be added task to tracking queue
-                SparkAppHttpWatcher.setOptionState(appParam.getId(), SparkOptionStateEnum.STARTING);
-                SparkAppHttpWatcher.doWatching(application);
-
-                // update app
-                updateById(application);
-                // save log
-                applicationLogService.save(applicationLog);
             });
+    }
+
+    /** Handles a failed start by recording the cause and moving the application out of STARTING. */
+    private void processStartException(
+                                       SparkApplication appParam,
+                                       Throwable throwable,
+                                       ApplicationLog applicationLog) {
+        String exception = ExceptionUtils.stringifyException(throwable);
+        applicationLog.setException(exception);
+        applicationLog.setSuccess(false);
+        applicationLogService.save(applicationLog);
+        if (throwable instanceof CancellationException) {
+            doStopped(appParam.getId());
+            return;
+        }
+        SparkApplication app = getById(appParam.getId());
+        app.setState(SparkAppStateEnum.FAILED.getValue());
+        app.setOptionState(SparkOptionStateEnum.NONE.getValue());
+        updateById(app);
+        SparkAppHttpWatcher.unWatching(appParam.getId());
+    }
+
+    /**
+     * Routes an unexpected post-submit failure to the standard failure handling, so the
+     * application leaves STARTING with the cause recorded instead of wedging silently.
+     */
+    private void recordStartFailure(
+                                    SparkApplication appParam,
+                                    Throwable throwable,
+                                    ApplicationLog applicationLog) {
+        try {
+            processStartException(appParam, throwable, applicationLog);
+        } catch (Exception e) {
+            log.error(
+                "[StreamPark] Failed to record the start failure of application "
+                    + appParam.getId(),
+                e);
+        }
     }
 
     /**
